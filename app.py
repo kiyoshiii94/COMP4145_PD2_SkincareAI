@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 import sqlite3
 from datetime import date, datetime, timedelta
 from html import escape
@@ -178,6 +179,79 @@ def parse_response(response_body: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
+def normalise_analysis_result(response_body: dict[str, Any]) -> dict[str, Any]:
+    aliases = {
+        "skin_cleanliness_score": ("skin cleanliness", "cleanliness", "cleanliness score"),
+        "skin_quality_score": ("skin quality", "quality", "quality score"),
+        "hydration": ("hydration",),
+        "pores": ("pores", "pore congestion"),
+        "redness": ("redness", "redness sensitivity"),
+        "texture": ("texture", "pigmentation texture"),
+        "estimated_age_range": ("estimated age range", "estimated age", "age range"),
+        "overall_condition_summary": ("overall condition summary", "condition summary", "summary"),
+    }
+    score_keys = {"skin_cleanliness_score", "skin_quality_score", "hydration", "pores", "redness", "texture"}
+    normalised_aliases = {
+        canonical: {re.sub(r"[^a-z0-9]", "", alias) for alias in possible_keys}
+        for canonical, possible_keys in aliases.items()
+    }
+    result: dict[str, Any] = dict(response_body)
+
+    def extract_metric_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            for key in ("score", "value", "rating", "numeric_score", "score_10", "result"):
+                if key in value:
+                    return extract_metric_value(value[key])
+        if isinstance(value, list):
+            for item in value:
+                extracted = extract_metric_value(item)
+                if extracted is not None:
+                    return extracted
+        return value
+
+    def has_numeric_score(value: Any) -> bool:
+        value = extract_metric_value(value)
+        if isinstance(value, (int, float)):
+            return True
+        return isinstance(value, str) and re.search(r"\d+(?:\.\d+)?", value) is not None
+
+    def visit(value: Any, label: str = "") -> None:
+        if isinstance(value, dict):
+            item_label = label
+            label_value = None
+            for key, nested in value.items():
+                key_name = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                for canonical, names in normalised_aliases.items():
+                    if key_name in names or key_name.removesuffix("score") in names:
+                        candidate = extract_metric_value(nested)
+                        if canonical not in score_keys or has_numeric_score(candidate):
+                            result[canonical] = candidate
+                if key_name in {"name", "metric", "category", "label"} and isinstance(nested, str):
+                    item_label = nested
+                if key_name in {"score", "value", "rating", "numericscore", "score10", "result"}:
+                    label_value = nested
+                visit(nested, str(key))
+            label_name = re.sub(r"[^a-z0-9]", "", item_label.lower())
+            for canonical, names in normalised_aliases.items():
+                if label_name in names or label_name.removesuffix("score") in names:
+                    metric_value = extract_metric_value(value)
+                    if metric_value is not None:
+                        if canonical not in score_keys or has_numeric_score(metric_value):
+                            result[canonical] = metric_value
+        elif isinstance(value, list):
+            for item in value:
+                visit(item, label)
+
+    visit(response_body)
+    missing = [
+        key for key in aliases
+        if key not in result or (key in score_keys and not has_numeric_score(result[key]))
+    ]
+    if missing:
+        raise ValueError(f"The API response is missing required metrics: {', '.join(missing)}.")
+    return result
+
+
 def request_analysis(api_key: str, model: str, image_bytes: bytes, mime_type: str) -> dict[str, Any]:
     prompt = """Review this facial image for a cosmetic, non-medical skin quality check.
 Return only JSON with keys: skin_cleanliness_score, skin_cleanliness_review,
@@ -197,17 +271,38 @@ observable language and say the result is image-based and not medical advice."""
     }
     response = requests.post(
         ENDPOINT_URL,
-        headers={"api-key": api_key, "Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        headers={"api-key": api_key, "Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
         json=payload,
         timeout=120,
     )
     response.raise_for_status()
-    return parse_response(response.json())
+    return normalise_analysis_result(parse_response(response.json()))
+
+
+def extract_score_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        for name in ("score", "value", "rating", "numeric_score", "score_10", "result"):
+            if name in value:
+                return extract_score_value(value[name])
+        return None
+    if isinstance(value, list):
+        for item in value:
+            extracted = extract_score_value(item)
+            if extracted is not None:
+                return extracted
+        return None
+    return value
 
 
 def score(result: dict[str, Any], key: str) -> float:
     try:
-        return max(0.0, min(10.0, float(result.get(key, 0))))
+        value = extract_score_value(result.get(key))
+        if isinstance(value, str):
+            match = re.search(r"\d+(?:\.\d+)?", value)
+            if not match:
+                return 0.0
+            value = match.group()
+        return max(0.0, min(10.0, float(value)))
     except (TypeError, ValueError):
         return 0.0
 
@@ -353,10 +448,22 @@ def render_matcher(result: dict[str, Any]) -> None:
         ("Redness & Sensitivity", "redness", "Centella Asiatica (Cica) + Azelaic Acid", "AM & PM safe", "Soothing options for a calmer-looking complexion."),
         ("Texture / Skin Quality", "texture", "Vitamin C + Retinal", "Vitamin C: AM · Retinal: PM", "Separate these timings; always use SPF with Vitamin C."),
     ]
+    priority_matches = []
     for label, key, ingredients, timing, reason in rules:
         if score(result, key) < 7.5:
+            priority_matches.append((label, ingredients, timing, reason))
+    if priority_matches:
+        for label, ingredients, timing, reason in priority_matches:
             st.markdown(
                 f'<div class="match-row"><strong>{escape(label)}</strong> · {escape(ingredients)}'
+                f'<span class="badge">{escape(timing)}</span><br><small>{escape(reason)}</small></div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        st.success("No priority concerns detected. These ingredients can help maintain the current skin condition.")
+        for label, _, ingredients, timing, reason in rules:
+            st.markdown(
+                f'<div class="match-row"><strong>{escape(label)} maintenance</strong> · {escape(ingredients)}'
                 f'<span class="badge">{escape(timing)}</span><br><small>{escape(reason)}</small></div>',
                 unsafe_allow_html=True,
             )
@@ -415,9 +522,10 @@ def render_tab_one() -> None:
                     st.session_state.result = request_analysis(st.session_state.api_key.strip(), st.session_state.model, uploaded.getvalue(), uploaded.type or "image/jpeg")
                     st.session_state.demo_mode = False
                 except (requests.RequestException, ValueError, json.JSONDecodeError) as error:
-                    st.session_state.result = demo_result()
-                    st.session_state.demo_mode = True
-                    st.warning(f"API unavailable; Demo Mode loaded instead. ({error})")
+                    st.session_state.result = None
+                    st.session_state.demo_mode = False
+                    st.error(f"API analysis failed. No demo result was substituted: {error}")
+        result = st.session_state.result
     with right:
         st.markdown('<div class="panel-title">2. Evaluation Results</div>', unsafe_allow_html=True)
         if result:
@@ -532,6 +640,8 @@ st.markdown(
     @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Playfair+Display:wght@600&display=swap');
     .stApp{background:#f5f8fa;color:#23343b;font-family:'DM Sans',sans-serif}
     [data-testid="stSidebar"]{background:#102a33}[data-testid="stSidebar"] *{color:#eaf3f3!important}
+    [data-testid="stSidebar"] input{background:#f7fbfc!important;color:#173a42!important;-webkit-text-fill-color:#173a42!important}
+    [data-testid="stSidebar"] input::placeholder{color:#71878c!important;-webkit-text-fill-color:#71878c!important}
     .brand{color:#8bd1c7;font-size:1.45rem;font-weight:700;letter-spacing:.08em}.brand-note{color:#a9c1c5;font-size:.78rem;margin-bottom:2rem}
     h1{font-family:'Playfair Display',serif;color:#173a42;font-size:2.5rem}.subtitle{color:#6d8186;margin-top:-.8rem;margin-bottom:2rem}
     .panel-title{color:#173a42;font-size:1.18rem;font-weight:700;margin-bottom:1rem}.section-label{color:#719096;font-size:.72rem;font-weight:700;letter-spacing:.14em;margin:.25rem 0 1rem}
@@ -560,7 +670,8 @@ with st.sidebar:
     st.markdown("### Analysis Settings")
     st.session_state.api_key = st.text_input("API key", type="password", placeholder="Enter your API key")
     st.session_state.model = st.selectbox("Model", MODEL_OPTIONS, index=0)
-    st.session_state.username = st.text_input("User Profile Login", value="demo_customer")
+    username_input = st.text_input("User Profile Login", value="", placeholder="Enter a profile name")
+    st.session_state.username = username_input.strip() or "guest_user"
     if st.button("Load Sample Demo Scan (No API Key Needed)", use_container_width=True):
         st.session_state.result = demo_result()
         st.session_state.demo_mode = True
