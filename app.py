@@ -254,10 +254,23 @@ def normalise_analysis_result(response_body: dict[str, Any]) -> dict[str, Any]:
 
 def request_analysis(api_key: str, model: str, image_bytes: bytes, mime_type: str) -> dict[str, Any]:
     prompt = """Review this facial image for a cosmetic, non-medical skin quality check.
-Return only JSON with keys: skin_cleanliness_score, skin_cleanliness_review,
-skin_quality_score, skin_quality_review, estimated_age_range, overall_condition_summary,
-hydration, pores, redness, texture. Scores must be numbers from 0 to 10. Use neutral,
-observable language and say the result is image-based and not medical advice."""
+Return ONLY one valid JSON object. The values of skin_cleanliness_score, skin_quality_score,
+hydration, pores, redness, and texture MUST be numeric JSON numbers from 0 to 10.
+Do not put descriptions in those six fields; put descriptions in their corresponding
+review fields. Use exactly this structure:
+{
+  "skin_cleanliness_score": 8,
+  "skin_cleanliness_review": "brief observation",
+  "skin_quality_score": 8,
+  "skin_quality_review": "brief observation",
+  "estimated_age_range": "24-29 years",
+  "overall_condition_summary": "brief image-based summary",
+  "hydration": 8,
+  "pores": 8,
+  "redness": 8,
+  "texture": 8
+}
+Use neutral, observable language and say the result is image-based and not medical advice."""
     payload = {
         "model": model,
         "messages": [
@@ -269,14 +282,28 @@ observable language and say the result is image-based and not medical advice."""
         ],
         "temperature": 0.2,
     }
-    response = requests.post(
-        ENDPOINT_URL,
-        headers={"api-key": api_key, "Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
-        json=payload,
-        timeout=120,
-    )
-    response.raise_for_status()
-    return normalise_analysis_result(parse_response(response.json()))
+    headers = {
+        "api-key": api_key,
+        "Authorization": "Bearer " + api_key,
+        "Content-Type": "application/json",
+    }
+    last_error: ValueError | None = None
+    for attempt in range(2):
+        if attempt:
+            payload["messages"].insert(
+                1,
+                {
+                    "role": "user",
+                    "content": "Your previous response omitted numeric scores. Return the exact JSON structure requested. All six score fields must be numbers, not prose.",
+                },
+            )
+        response = requests.post(ENDPOINT_URL, headers=headers, json=payload, timeout=120)
+        response.raise_for_status()
+        try:
+            return normalise_analysis_result(parse_response(response.json()))
+        except ValueError as error:
+            last_error = error
+    raise last_error or ValueError("The API did not return usable numeric skin metrics.")
 
 
 def extract_score_value(value: Any) -> Any:
